@@ -1,0 +1,44 @@
+{
+  "schedule": {
+    "times": ["07:55", "12:55"],
+    "days": ["mon", "tue", "wed", "thu", "fri"],
+    "timezone": "Asia/Taipei"
+  },
+  "site": {
+    "login_url": "https://example.com/login",
+    "username": "YOUR_ACCOUNT",
+    "password": "YOUR_PASSWORD",
+    "browser": "chromium",
+    "headless": false
+  },
+  "selectors": {
+    "username": "#username",
+    "password": "#password",
+    "captcha_input": "#captcha",
+    "captcha_image": "#captchaImg",
+    "login_submit": "#loginBtn",
+    "target_button": "#checkinBtn",
+    "post_login_ready": "#dashboard",
+    "target_done": "text=Completed"
+  },
+  "timing": {
+    "navigation_timeout_ms": 30000,
+    "wait_timeout_ms": 15000
+  },
+  "retry": {
+    "attempts": 2,
+    "wait_seconds": 5
+  },
+  "captcha": {
+    "input_mode": "line",
+    "wait_seconds": 180,
+    "poll_seconds": 2
+  },
+  "line": {
+    "enabled": true,
+    "channel_access_token": "YOUR_LINE_CHANNEL_ACCESS_TOKEN",
+    "user_id": "YOUR_LINE_USER_ID",
+    "public_base_url": "https://your-domain.example.com",
+    "inbox_file": "runtime/line_inbox.jsonl"
+  }
+}
