@@ -1,3 +1,23 @@
+"""
+Check_IN 自動化登入與排程執行程式
+
+開啟的網站網址：
+- https://pk12.cloudhr.tw/login.aspx
+
+功能概述：
+- 讀取 config.json 設定檔，載入網站登入資訊、排程時間、重試策略與驗證碼設定。
+- 依照指定的星期與時段，自動排程執行登入與點擊目標按鈕的任務。
+- 使用 Playwright 自動開啟瀏覽器、輸入帳號密碼、處理 CAPTCHA（手動輸入或 LINE 傳送驗證碼）。
+- 若登入或點擊流程失敗，自動重試，並保存錯誤截圖與執行日誌以便排查問題。
+- 支援立即執行一次任務（--run-now）或依照 cron 類似排程持續執行。
+- 可將驗證碼圖片透過 LINE 通知使用者，讓使用者回覆後再自動填入網頁。
+
+適用場景：
+- 定時執行網站自動化操作。
+- 需要處理登入驗證碼與定時任務的情境。
+- 需監控失敗重試與截圖紀錄的自動化流程。
+"""
+
 import json
 import logging
 import re
@@ -25,9 +45,9 @@ class SelectorConfig:
     username: str
     password: str
     captcha_input: str
-    captcha_image: str | None = None
     login_submit: str
     target_button: str
+    captcha_image: str | None = None
     post_login_ready: str | None = None
     target_done: str | None = None
 
@@ -108,6 +128,29 @@ def setup_logging() -> None:
         format="%(asctime)s | %(levelname)s | %(message)s",
         handlers=[logging.FileHandler(log_file, encoding="utf-8"), logging.StreamHandler(sys.stdout)],
     )
+
+
+def get_chrome_profile_dir() -> Path | None:
+    candidates = [
+        Path.home() / "AppData" / "Local" / "Google" / "Chrome" / "User Data",
+        Path.home() / "AppData" / "Local" / "Google" / "Chrome SxS" / "User Data",
+        Path.home() / "AppData" / "Local" / "Microsoft" / "Edge" / "User Data",
+    ]
+
+    for path in candidates:
+        if path.exists():
+            return path
+    return None
+
+
+def is_placeholder_value(value: str | None) -> bool:
+    if value is None:
+        return True
+    cleaned = value.strip()
+    if not cleaned:
+        return True
+    placeholders = {"your_account", "yourpassword", "your_username", "your_user", "username", "password"}
+    return cleaned.lower() in placeholders or cleaned.lower().startswith("your_")
 
 
 def load_config(path: Path) -> AppConfig:
@@ -251,8 +294,12 @@ def get_captcha_text(page, config: AppConfig) -> str:
 def take_error_screenshot(page, prefix: str) -> None:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     file_path = LOG_DIR / f"{prefix}-{stamp}.png"
-    page.screenshot(path=str(file_path), full_page=True)
-    logging.info("Saved screenshot: %s", file_path)
+
+    try:
+        page.screenshot(path=str(file_path), full_page=True)
+        logging.info("Saved screenshot: %s", file_path)
+    except Exception:
+        logging.warning("Could not save screenshot for %s because the page is already closed", prefix)
 
 
 def run_once(config: AppConfig) -> None:
@@ -263,19 +310,60 @@ def run_once(config: AppConfig) -> None:
         if browser_type is None:
             raise ValueError(f"Unsupported browser type: {config.site.browser}")
 
-        browser = browser_type.launch(headless=config.site.headless)
-        context = browser.new_context()
-        page = context.new_page()
+        browser = None
+        context = None
 
         try:
+            chrome_profile = get_chrome_profile_dir()
+            if chrome_profile and config.site.browser.lower() in {"chromium", "chrome"}:
+                try:
+                    context = browser_type.launch_persistent_context(
+                        str(chrome_profile),
+                        headless=config.site.headless,
+                        channel="chrome",
+                    )
+                    logging.info("Using Chrome profile for saved credentials: %s", chrome_profile)
+                except Exception as exc:
+                    logging.warning("Chrome persistent profile unavailable, falling back to normal browser launch: %s", exc)
+                    browser = browser_type.launch(headless=config.site.headless)
+                    context = browser.new_context()
+            else:
+                browser = browser_type.launch(headless=config.site.headless)
+                context = browser.new_context()
+
+            page = context.new_page()
+
             page.goto(
                 config.site.login_url,
                 wait_until="domcontentloaded",
                 timeout=config.timing.navigation_timeout_ms,
             )
 
-            page.fill(config.selectors.username, config.site.username)
-            page.fill(config.selectors.password, config.site.password)
+            username_field = page.locator(config.selectors.username)
+            password_field = page.locator(config.selectors.password)
+
+            if is_placeholder_value(config.site.username) or is_placeholder_value(config.site.password):
+                logging.info("Using Chrome saved credentials autofill flow.")
+                username_field.click()
+                page.wait_for_timeout(800)
+                username_field.focus()
+                page.wait_for_timeout(800)
+
+                if username_field.input_value() == "":
+                    username_field.press("Tab")
+                    page.wait_for_timeout(800)
+
+                password_field.click()
+                page.wait_for_timeout(800)
+                password_field.focus()
+                page.wait_for_timeout(1500)
+
+                if password_field.input_value() == "":
+                    page.keyboard.press("Tab")
+                    page.wait_for_timeout(800)
+            else:
+                username_field.fill(config.site.username)
+                password_field.fill(config.site.password)
 
             if config.selectors.captcha_input:
                 captcha_text = get_captcha_text(page, config)
@@ -303,8 +391,10 @@ def run_once(config: AppConfig) -> None:
             take_error_screenshot(page, "error")
             raise
         finally:
-            context.close()
-            browser.close()
+            if context is not None:
+                context.close()
+            if browser is not None:
+                browser.close()
 
 
 def run_with_retry(config: AppConfig) -> None:
