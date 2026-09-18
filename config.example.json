@@ -1,6 +1,6 @@
 {
   "schedule": {
-    "times": ["07:55", "12:55"],
+    "times": ["07:30"],
     "days": ["mon", "tue", "wed", "thu", "fri"],
     "timezone": "Asia/Taipei"
   },

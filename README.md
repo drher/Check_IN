@@ -67,21 +67,23 @@ One practical way:
 If your static server maps root directly to `runtime/`, `current.png` can be served by:
 `https://<your-domain>/captcha/current.png`
 
-## 4) Run once (for testing)
+## 4) 執行模式
 
-```powershell
-python main.py --run-now
-```
+### 自動執行
 
-## 5) Run as scheduler process
+直接啟動程式，會在星期一至星期五每天 07:30 執行一次：
 
-```powershell
-python main.py
-```
+在 VS Code 開啟 `check_in.ipynb`，執行第 6 格自動排程 cell。
 
-Keep the process running. It will execute at the configured time.
+程式需要保持執行中，才能在排程時間啟動任務。
 
-## 6) How to find selectors
+### 手動執行（開發測試）
+
+使用 `--run-now` 立即執行一次，不會啟動常駐排程：
+
+在 VS Code 開啟 `check_in.ipynb`，執行第 4 格手動測試 cell。
+
+## 5) How to find selectors
 
 1. Open Chrome/Edge Developer Tools (F12).
 2. Use element picker and inspect each input/button.
