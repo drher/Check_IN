@@ -18,6 +18,8 @@
     "captcha_image": "#captchaImg",
     "captcha_refresh": "#captchaRefreshBtn",
     "login_submit": "#loginBtn",
+    "sign_in_button": "button:has-text(\"上班簽到\")",
+    "sign_out_button": "button:has-text(\"下班簽退\")",
     "target_button": "button:has-text(\"下班簽退\")",
     "post_login_ready": "#dashboard",
     "target_done": "text=Completed"
