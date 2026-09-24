@@ -1,0 +1,3 @@
+Set shell = CreateObject("WScript.Shell")
+command = "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command ""$script = Get-ChildItem -Path $env:USERPROFILE -Filter check_in_app.py -File -Recurse | Where-Object { $_.FullName -like '*GitHub\Check_IN\check_in_app.py' } | Select-Object -First 1 -ExpandProperty FullName; if ($script) { $python = (py -3 -c ([char]34 + 'import sys; print(sys.executable)' + [char]34)).Trim(); $pythonw = Join-Path (Split-Path $python) 'pythonw.exe'; Start-Process -FilePath $pythonw -ArgumentList @($script) -WindowStyle Hidden }"""
+shell.Run command, 0, False
