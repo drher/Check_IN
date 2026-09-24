@@ -229,6 +229,11 @@ def open_login_page_with_captcha(config: AppConfig) -> None:
             page.fill(config.selectors.captcha_input, get_captcha(page, config))
         page.wait_for_timeout(2000)
         page.click(config.selectors.login_submit)
+        try:
+            page.wait_for_load_state('domcontentloaded', timeout=5000)
+        except PlaywrightTimeoutError:
+            pass
+        page.evaluate("document.documentElement.style.zoom = '80%'")
         while browser.is_connected() and not page.is_closed():
             time.sleep(0.5)
         context.close()
