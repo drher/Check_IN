@@ -3,11 +3,13 @@ import logging
 import random
 import re
 import time
-from collections import Counter
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from queue import Empty, Queue
+from threading import Event
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -15,10 +17,11 @@ import requests
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
-CONFIG_PATH = Path('config.json')
-LOG_DIR = Path('logs')
-CAPTCHA_DIR = Path('runtime') / 'captcha'
-SCHEDULE_FILE = Path('runtime') / 'schedule.json'
+BASE_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = BASE_DIR / 'config.json'
+LOG_DIR = BASE_DIR / 'logs'
+CAPTCHA_DIR = BASE_DIR / 'runtime' / 'captcha'
+SCHEDULE_FILE = BASE_DIR / 'runtime' / 'schedule.json'
 TIMEZONE = ZoneInfo('Asia/Taipei')
 DAY_LABELS = ['一', '二', '三', '四', '五', '六', '日']
 CHECK_IN_RANGE = ((7, 30), (7, 50))
@@ -143,6 +146,8 @@ def line_captcha(page, config: AppConfig) -> str:
     response.raise_for_status()
     deadline = time.time() + config.captcha.wait_seconds
     inbox = Path(config.line.inbox_file)
+    if not inbox.is_absolute():
+        inbox = BASE_DIR / inbox
     while time.time() < deadline:
         if inbox.exists():
             for line in reversed(inbox.read_text(encoding='utf-8').splitlines()):
@@ -214,12 +219,15 @@ def execute_action(config: AppConfig, selector: str) -> None:
             browser.close()
 
 
-def open_login_page_with_captcha(config: AppConfig) -> None:
+def open_login_page_with_captcha(config: AppConfig, pending_messages: Queue, action_label: str) -> None:
     with sync_playwright() as playwright:
         browser_type = getattr(playwright, config.site.browser)
         browser = browser_type.launch(headless=False, args=['--window-position=0,0', '--window-size=1280,900'])
         context = browser.new_context(no_viewport=True)
         page = context.new_page()
+        closed = Event()
+        browser.on('disconnected', lambda *_: closed.set())
+        page.on('close', lambda *_: closed.set())
         page.goto(config.site.login_url, wait_until='domcontentloaded', timeout=config.timing.navigation_timeout_ms)
         page.evaluate("document.documentElement.style.zoom = '67%'")
         if not is_placeholder(config.site.username) and not is_placeholder(config.site.password):
@@ -234,10 +242,22 @@ def open_login_page_with_captcha(config: AppConfig) -> None:
         except PlaywrightTimeoutError:
             pass
         page.evaluate("document.documentElement.style.zoom = '80%'")
-        while browser.is_connected() and not page.is_closed():
-            time.sleep(0.5)
-        context.close()
-        browser.close()
+        pending_messages.put(f'登入成功,準備{action_label}....')
+        while True:
+            try:
+                if not browser.is_connected() or closed.is_set() or not context.pages or page.is_closed():
+                    break
+                page.wait_for_timeout(500)
+            except Exception:
+                break
+        try:
+            context.close()
+        except Exception:
+            pass
+        try:
+            browser.close()
+        except Exception:
+            pass
 
 
 def run_action(config: AppConfig, selector: str) -> None:
@@ -308,7 +328,7 @@ def start_gui(config: AppConfig) -> None:
     enable_windows_dpi_awareness()
     root = tk.Tk()
     root.title('何帥簽到退系統')
-    root.geometry('520x500')
+    root.geometry('520x630')
     root.minsize(460, 420)
     root.option_add('*Font', ('Microsoft JhengHei UI', 12))
     root.option_add('*Button*Font', ('Microsoft JhengHei UI', 15, 'bold'))
@@ -323,7 +343,10 @@ def start_gui(config: AppConfig) -> None:
     fired: set[tuple[str, str]] = set()
     widgets = []
     schedule_entries = []
-    status = tk.StringVar(value='就緒')
+    initial_message = f'{datetime.now(TIMEZONE):%m/%d %H:%M:%S} 就緒'
+    status = tk.StringVar(value=initial_message)
+    message_history = deque([initial_message], maxlen=5)
+    pending_messages = Queue()
     table = ttk.Frame(root)
     table.pack(fill='x', padx=12, pady=(12, 0))
     actions = ttk.Frame(root)
@@ -331,30 +354,33 @@ def start_gui(config: AppConfig) -> None:
     sign_in = config.selectors.sign_in_button or 'button:has-text("上班簽到")'
     sign_out = config.selectors.sign_out_button or config.selectors.target_button
 
+    def add_message(message: str) -> None:
+        message_history.append(f'{datetime.now(TIMEZONE):%m/%d %H:%M:%S} {message}')
+        status.set('\n'.join(message_history))
+
     def stamp_status(label: str, outcome: str) -> None:
-        now = datetime.now(TIMEZONE)
-        status.set(f'{now:%Y/%m/%d %H:%M} {label}{outcome}')
+        add_message(f'{label}{outcome}')
 
     def action(selector: str, label: str) -> None:
-        status.set(f'{label}執行中...')
+        add_message(f'{label}執行中...')
         future = executor.submit(run_action, config, selector)
         def done(result) -> None:
             try:
                 result.result()
-                stamp_status(label, '成功')
+                pending_messages.put(f'{label}成功')
             except Exception:
-                stamp_status(label, '失敗')
+                pending_messages.put(f'{label}失敗')
         future.add_done_callback(done)
 
-    def open_login_page() -> None:
-        status.set('正在開啟登入畫面...')
-        future = executor.submit(open_login_page_with_captcha, config)
+    def open_login_page(action_label: str) -> None:
+        add_message('正在開啟登入畫面...')
+        future = executor.submit(open_login_page_with_captcha, config, pending_messages, action_label)
         def done(result) -> None:
             try:
                 result.result()
-                status.set('登入畫面已關閉')
+                pending_messages.put('登入畫面已經被關閉')
             except Exception:
-                status.set('開啟登入畫面失敗')
+                pending_messages.put('開啟登入畫面失敗')
         future.add_done_callback(done)
 
     def create_rounded_button(parent: tk.Misc, text: str, bg_color: str, active_color: str, command) -> tk.Button:
@@ -389,11 +415,11 @@ def start_gui(config: AppConfig) -> None:
     button_font = ('Microsoft JhengHei UI', 14, 'bold')
     save_button = tk.Button(actions, text='儲存設定', font=button_font, bg='#4b8ce8', fg='white', activebackground='#2d69b8', activeforeground='white', relief='raised', bd=3, highlightthickness=0, padx=8, pady=2, width=11, height=1, command=lambda: save_from_widgets())
     save_button.grid(row=0, column=1, sticky='ew', padx=5)
-    sign_in_button = create_rounded_button(actions, '簽到', '#59c66c', '#2d8f4d', open_login_page)
+    sign_in_button = create_rounded_button(actions, '簽到', '#59c66c', '#2d8f4d', lambda: open_login_page('簽到'))
     sign_in_button.grid(row=0, column=0, sticky='ew', padx=(0, 5))
-    sign_out_button = create_rounded_button(actions, '簽退', '#ef9a58', '#c66b2d', open_login_page)
+    sign_out_button = create_rounded_button(actions, '簽退', '#ef9a58', '#c66b2d', lambda: open_login_page('簽退'))
     sign_out_button.grid(row=0, column=2, sticky='ew', padx=(5, 0))
-    ttk.Label(root, textvariable=status, style='Status.TLabel').pack(pady=5)
+    ttk.Label(root, textvariable=status, style='Status.TLabel', anchor='w', justify='left').pack(fill='x', padx=12, pady=5)
 
     def save_from_widgets() -> bool:
         for check_in, check_out, enabled, row in widgets:
@@ -454,6 +480,11 @@ def start_gui(config: AppConfig) -> None:
     def tick() -> None:
         nonlocal previous_day
         now = datetime.now(TIMEZONE)
+        while True:
+            try:
+                add_message(pending_messages.get_nowait())
+            except Empty:
+                break
         if now.date() != previous_day:
             previous_day = now.date()
             render()
