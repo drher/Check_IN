@@ -214,6 +214,27 @@ def execute_action(config: AppConfig, selector: str) -> None:
             browser.close()
 
 
+def open_login_page_with_captcha(config: AppConfig) -> None:
+    with sync_playwright() as playwright:
+        browser_type = getattr(playwright, config.site.browser)
+        browser = browser_type.launch(headless=False, args=['--window-position=0,0', '--window-size=1280,900'])
+        context = browser.new_context(no_viewport=True)
+        page = context.new_page()
+        page.goto(config.site.login_url, wait_until='domcontentloaded', timeout=config.timing.navigation_timeout_ms)
+        page.evaluate("document.documentElement.style.zoom = '67%'")
+        if not is_placeholder(config.site.username) and not is_placeholder(config.site.password):
+            page.fill(config.selectors.username, config.site.username)
+            page.fill(config.selectors.password, config.site.password)
+        if config.selectors.captcha_input:
+            page.fill(config.selectors.captcha_input, get_captcha(page, config))
+        page.wait_for_timeout(2000)
+        page.click(config.selectors.login_submit)
+        while browser.is_connected() and not page.is_closed():
+            time.sleep(0.5)
+        context.close()
+        browser.close()
+
+
 def run_action(config: AppConfig, selector: str) -> None:
     last_error = None
     for attempt in range(config.retry.attempts):
@@ -261,26 +282,43 @@ def valid_time(value: str) -> bool:
     return bool(re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d', value.strip()))
 
 
+def enable_windows_dpi_awareness() -> None:
+    if __import__('sys').platform != 'win32':
+        return
+    import ctypes
+
+    try:
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+    except (AttributeError, OSError):
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except (AttributeError, OSError):
+            ctypes.windll.user32.SetProcessDPIAware()
+
+
 def start_gui(config: AppConfig) -> None:
     import tkinter as tk
     from tkinter import messagebox, ttk
 
+    enable_windows_dpi_awareness()
     root = tk.Tk()
     root.title('何帥簽到退系統')
-    root.geometry('560x500')
-    root.minsize(520, 460)
+    root.geometry('520x500')
+    root.minsize(460, 420)
     root.option_add('*Font', ('Microsoft JhengHei UI', 12))
+    root.option_add('*Button*Font', ('Microsoft JhengHei UI', 15, 'bold'))
+    root.option_add('*Entry*Font', ('Microsoft JhengHei UI', 12))
     style = ttk.Style(root)
     style.configure('Header.TLabel', font=('Microsoft JhengHei UI', 13, 'bold'), background='#285197', foreground='white')
-    style.configure('Date.TLabel', font=('Microsoft JhengHei UI', 12), anchor='center')
-    style.configure('Action.TButton', font=('Microsoft JhengHei UI', 14, 'bold'), padding=(8, 10))
-    style.configure('Save.TButton', font=('Microsoft JhengHei UI', 13, 'bold'), padding=(8, 8))
-    style.configure('Status.TLabel', font=('Microsoft JhengHei UI', 12))
+    style.configure('Date.TLabel', font=('Microsoft JhengHei UI', 13), anchor='center')
+    style.configure('Auto.TCheckbutton', font=('Microsoft JhengHei UI', 12), anchor='center')
+    style.configure('Status.TLabel', font=('Microsoft JhengHei UI', 12, 'bold'))
     executor = ThreadPoolExecutor(max_workers=2)
     rows = load_schedule()
     fired: set[tuple[str, str]] = set()
     widgets = []
-    status = tk.StringVar(value='系統就緒')
+    schedule_entries = []
+    status = tk.StringVar(value='就緒')
     table = ttk.Frame(root)
     table.pack(fill='x', padx=12, pady=(12, 0))
     actions = ttk.Frame(root)
@@ -288,19 +326,68 @@ def start_gui(config: AppConfig) -> None:
     sign_in = config.selectors.sign_in_button or 'button:has-text("上班簽到")'
     sign_out = config.selectors.sign_out_button or config.selectors.target_button
 
+    def stamp_status(label: str, outcome: str) -> None:
+        now = datetime.now(TIMEZONE)
+        status.set(f'{now:%Y/%m/%d %H:%M} {label}{outcome}')
+
     def action(selector: str, label: str) -> None:
         status.set(f'{label}執行中...')
         future = executor.submit(run_action, config, selector)
         def done(result) -> None:
             try:
                 result.result()
-                status.set(f'{label}完成')
+                stamp_status(label, '成功')
             except Exception:
-                status.set(f'{label}失敗，請查看 logs')
+                stamp_status(label, '失敗')
         future.add_done_callback(done)
 
-    ttk.Button(actions, text='簽到', style='Action.TButton', width=7, command=lambda: action(sign_in, '簽到')).pack(side='left', padx=(0, 8))
-    ttk.Button(actions, text='簽退', style='Action.TButton', width=7, command=lambda: action(sign_out, '簽退')).pack(side='right', padx=(8, 0))
+    def open_login_page() -> None:
+        status.set('正在開啟登入畫面...')
+        future = executor.submit(open_login_page_with_captcha, config)
+        def done(result) -> None:
+            try:
+                result.result()
+                status.set('登入畫面已關閉')
+            except Exception:
+                status.set('開啟登入畫面失敗')
+        future.add_done_callback(done)
+
+    def create_rounded_button(parent: tk.Misc, text: str, bg_color: str, active_color: str, command) -> tk.Button:
+        button = tk.Button(
+            parent,
+            text=text,
+            font=('Microsoft JhengHei UI', 14, 'bold'),
+            bg=bg_color,
+            fg='white',
+            activebackground=active_color,
+            activeforeground='white',
+            relief='raised',
+            bd=3,
+            highlightthickness=0,
+            padx=8,
+            pady=2,
+            width=10,
+            height=1,
+            command=command,
+            cursor='hand2'
+        )
+        button.config(
+            highlightbackground=bg_color,
+            overrelief='raised',
+            compound='center'
+        )
+        return button
+
+    for column in range(3):
+        actions.columnconfigure(column, weight=1, uniform='action')
+
+    button_font = ('Microsoft JhengHei UI', 14, 'bold')
+    save_button = tk.Button(actions, text='儲存設定', font=button_font, bg='#4b8ce8', fg='white', activebackground='#2d69b8', activeforeground='white', relief='raised', bd=3, highlightthickness=0, padx=8, pady=2, width=11, height=1, command=lambda: save_from_widgets())
+    save_button.grid(row=0, column=1, sticky='ew', padx=5)
+    sign_in_button = create_rounded_button(actions, '簽到', '#59c66c', '#2d8f4d', open_login_page)
+    sign_in_button.grid(row=0, column=0, sticky='ew', padx=(0, 5))
+    sign_out_button = create_rounded_button(actions, '簽退', '#ef9a58', '#c66b2d', open_login_page)
+    sign_out_button.grid(row=0, column=2, sticky='ew', padx=(5, 0))
     ttk.Label(root, textvariable=status, style='Status.TLabel').pack(pady=5)
 
     def save_from_widgets() -> bool:
@@ -310,7 +397,18 @@ def start_gui(config: AppConfig) -> None:
                 return False
             row.update(check_in=check_in.get().strip(), check_out=check_out.get().strip(), enabled=enabled.get())
         save_schedule(rows)
+        save_button.configure(bg='#3c83c6', activebackground='#286aa5')
         return True
+
+    def mark_schedule_dirty(*_args) -> None:
+        save_button.configure(bg='#d94141', activebackground='#b52d2d')
+
+    def is_past_schedule(date_value: str, time_value: str, now: datetime) -> bool:
+        return date_value == now.date().isoformat() and valid_time(time_value) and time_value <= now.strftime('%H:%M')
+
+    def update_entry_styles(now: datetime) -> None:
+        for entry, date_value, time_variable in schedule_entries:
+            entry.configure(bg='#ffd6d6' if is_past_schedule(date_value, time_variable.get(), now) else 'white')
 
     def render() -> None:
         nonlocal rows, widgets
@@ -318,20 +416,33 @@ def start_gui(config: AppConfig) -> None:
             save_from_widgets()
         rows = load_schedule()
         widgets = []
+        schedule_entries.clear()
         for child in table.winfo_children():
             child.destroy()
-        for column, label in enumerate(('日期', '簽到時間', '簽退時間', '自動執行')):
-            ttk.Label(table, text=label, style='Header.TLabel', anchor='center').grid(row=0, column=column, sticky='nsew', padx=1, pady=1)
-            table.columnconfigure(column, weight=1)
+        column_widths = (140, 48, 48, 76)
+        table.columnconfigure(0, weight=2, minsize=column_widths[0])
+        table.columnconfigure(1, weight=1, minsize=column_widths[1])
+        table.columnconfigure(2, weight=1, minsize=column_widths[2])
+        table.columnconfigure(3, weight=1, minsize=column_widths[3])
+        table.grid_columnconfigure(3, pad=2)
+        for column, label in enumerate(('日期', '簽到時間', '簽退時間', '自動')):
+            ttk.Label(table, text=label, style='Header.TLabel', anchor='center', justify='center').grid(row=0, column=column, sticky='nsew', padx=0, pady=0)
         for index, row in enumerate(rows, 1):
             current = date.fromisoformat(row['date'])
-            ttk.Label(table, text=f'{current.month}/{current.day}（{row["weekday"]}）', style='Date.TLabel').grid(row=index, column=0, sticky='nsew', padx=1, pady=1)
+            ttk.Label(table, text=f'{current.month}/{current.day}（{row["weekday"]}）', style='Date.TLabel', anchor='center', justify='center').grid(row=index, column=0, sticky='ew', padx=0, pady=0)
             check_in = tk.StringVar(value=row['check_in'])
             check_out = tk.StringVar(value=row['check_out'])
             enabled = tk.BooleanVar(value=row['enabled'])
-            ttk.Entry(table, textvariable=check_in, justify='center', font=('Microsoft JhengHei UI', 12)).grid(row=index, column=1, sticky='nsew', padx=1, pady=1)
-            ttk.Entry(table, textvariable=check_out, justify='center', font=('Microsoft JhengHei UI', 12)).grid(row=index, column=2, sticky='nsew', padx=1, pady=1)
-            ttk.Checkbutton(table, text='ON', variable=enabled).grid(row=index, column=3, sticky='nsew', padx=1, pady=1)
+            check_in.trace_add('write', mark_schedule_dirty)
+            check_out.trace_add('write', mark_schedule_dirty)
+            check_in_entry = tk.Entry(table, textvariable=check_in, justify='center', bg='white', relief='solid', bd=1, highlightthickness=0)
+            check_in_entry.grid(row=index, column=1, sticky='ew', padx=0, pady=0)
+            check_out_entry = tk.Entry(table, textvariable=check_out, justify='center', bg='white', relief='solid', bd=1, highlightthickness=0)
+            check_out_entry.grid(row=index, column=2, sticky='ew', padx=0, pady=0)
+            schedule_entries.extend(((check_in_entry, row['date'], check_in), (check_out_entry, row['date'], check_out)))
+            check_in_entry.bind('<Return>', lambda event: root.focus_set())
+            check_out_entry.bind('<Return>', lambda event: root.focus_set())
+            ttk.Checkbutton(table, text='ON', variable=enabled, style='Auto.TCheckbutton').grid(row=index, column=3, sticky='nsew', padx=0, pady=0)
             widgets.append((check_in, check_out, enabled, row))
 
     previous_day = datetime.now(TIMEZONE).date()
@@ -343,6 +454,7 @@ def start_gui(config: AppConfig) -> None:
             render()
         current_key = now.date().isoformat()
         current_time = now.strftime('%H:%M')
+        update_entry_styles(now)
         for check_in, check_out, enabled, row in widgets:
             if enabled.get() and row['date'] == current_key:
                 for kind, scheduled, selector, label in (('in', check_in.get(), sign_in, '自動簽到'), ('out', check_out.get(), sign_out, '自動簽退')):
@@ -352,7 +464,6 @@ def start_gui(config: AppConfig) -> None:
                         action(selector, label)
         root.after(1000, tick)
 
-    ttk.Button(actions, text='儲存設定', style='Save.TButton', command=save_from_widgets).pack(side='left', expand=True, fill='x', padx=8)
     render()
     tick()
     root.protocol('WM_DELETE_WINDOW', lambda: (save_from_widgets(), executor.shutdown(wait=False, cancel_futures=True), root.destroy()))
