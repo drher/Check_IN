@@ -211,7 +211,8 @@ def execute_action(config: AppConfig, selector: str) -> None:
                     if attempt == 2:
                         raise
                     page.reload(wait_until='domcontentloaded', timeout=config.timing.navigation_timeout_ms)
-            page.click(selector)
+            if not click_visible_control(page.locator(selector)):
+                raise ValueError(f'找不到可點擊的控制項: {selector}')
             if config.selectors.target_done:
                 page.wait_for_selector(config.selectors.target_done, timeout=config.timing.wait_timeout_ms)
         finally:
@@ -219,7 +220,48 @@ def execute_action(config: AppConfig, selector: str) -> None:
             browser.close()
 
 
-def open_login_page_with_captcha(config: AppConfig, pending_messages: Queue, action_label: str) -> None:
+def click_visible_control(locator) -> bool:
+    for index in range(locator.count()):
+        control = locator.nth(index)
+        try:
+            if control.is_visible() and not control.is_disabled():
+                return bool(control.evaluate('element => { element.click(); return true; }'))
+        except Exception:
+            continue
+    return False
+
+
+def click_action_control(page, action_selector: str, action_text: str) -> None:
+    for frame in page.frames:
+        try:
+            if click_visible_control(frame.locator(action_selector)):
+                return
+        except Exception:
+            pass
+        try:
+            clicked = frame.evaluate(
+                """label => {
+                    const controls = document.querySelectorAll('input, button, a, [role="button"]');
+                    for (const control of controls) {
+                        const text = (control.value || control.innerText || control.textContent || control.getAttribute('aria-label') || '').trim();
+                        const visible = control.getBoundingClientRect().width > 0 && control.getBoundingClientRect().height > 0;
+                        if (text === label && visible && !control.disabled) {
+                            control.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }""",
+                action_text,
+            )
+            if clicked:
+                return
+        except Exception:
+            pass
+    raise ValueError(f'找不到可點擊的{action_text}按鈕: {action_selector}')
+
+
+def open_login_page_with_captcha(config: AppConfig, pending_messages: Queue, action_label: str, action_selector: str, action_text: str) -> None:
     with sync_playwright() as playwright:
         browser_type = getattr(playwright, config.site.browser)
         browser = browser_type.launch(headless=False, args=['--window-position=0,0', '--window-size=1280,900'])
@@ -243,6 +285,9 @@ def open_login_page_with_captcha(config: AppConfig, pending_messages: Queue, act
             pass
         page.evaluate("document.documentElement.style.zoom = '80%'")
         pending_messages.put(f'登入成功,準備{action_label}....')
+        page.wait_for_timeout(2000)
+        click_action_control(page, action_selector, action_text)
+        pending_messages.put(f'{action_label}成功')
         while True:
             try:
                 if not browser.is_connected() or closed.is_set() or not context.pages or page.is_closed():
@@ -374,7 +419,9 @@ def start_gui(config: AppConfig) -> None:
 
     def open_login_page(action_label: str) -> None:
         add_message('正在開啟登入畫面...')
-        future = executor.submit(open_login_page_with_captcha, config, pending_messages, action_label)
+        action_selector = sign_in if action_label == '簽到' else sign_out
+        action_text = '上班簽到' if action_label == '簽到' else '下班簽退'
+        future = executor.submit(open_login_page_with_captcha, config, pending_messages, action_label, action_selector, action_text)
         def done(result) -> None:
             try:
                 result.result()
