@@ -1,0 +1,3 @@
+[
+  "tests/test_config_target_button.py::test_target_button_is_sign_out_selector"
+]

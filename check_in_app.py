@@ -179,45 +179,50 @@ def get_captcha(page, config: AppConfig) -> str:
     raise ValueError(f'Unsupported captcha input mode: {config.captcha.input_mode}')
 
 
-def execute_action(config: AppConfig, selector: str) -> None:
+def execute_action(config: AppConfig, selector: str, action_text: str, pending_messages: Queue) -> None:
     with sync_playwright() as playwright:
         browser_type = getattr(playwright, config.site.browser)
-        browser = browser_type.launch(headless=config.site.headless, args=['--window-position=0,0', '--window-size=1280,900'])
+        browser = browser_type.launch(headless=False, args=['--window-position=0,0', '--window-size=1280,900'])
         context = browser.new_context(no_viewport=True)
         page = context.new_page()
+        closed = Event()
+        browser.on('disconnected', lambda *_: closed.set())
+        page.on('close', lambda *_: closed.set())
         try:
             page.goto(config.site.login_url, wait_until='domcontentloaded', timeout=config.timing.navigation_timeout_ms)
-            for attempt in range(3):
-                username = page.locator(config.selectors.username)
-                password = page.locator(config.selectors.password)
-                if is_placeholder(config.site.username) or is_placeholder(config.site.password):
-                    username.click()
-                    password.click()
-                else:
-                    username.fill(config.site.username)
-                    password.fill(config.site.password)
-                if config.selectors.captcha_input:
-                    page.fill(config.selectors.captcha_input, get_captcha(page, config))
-                    if VERIFY_CAPTCHA_ONLY:
-                        while True:
-                            page.wait_for_timeout(1000)
-                page.click(config.selectors.login_submit)
-                if not config.selectors.post_login_ready:
-                    break
+            page.evaluate("document.documentElement.style.zoom = '67%'")
+            if not is_placeholder(config.site.username) and not is_placeholder(config.site.password):
+                page.fill(config.selectors.username, config.site.username)
+                page.fill(config.selectors.password, config.site.password)
+            if config.selectors.captcha_input:
+                page.fill(config.selectors.captcha_input, get_captcha(page, config))
+            page.wait_for_timeout(2000)
+            page.click(config.selectors.login_submit)
+            try:
+                page.wait_for_load_state('domcontentloaded', timeout=5000)
+            except PlaywrightTimeoutError:
+                pass
+            page.evaluate("document.documentElement.style.zoom = '80%'")
+            pending_messages.put(f'登入完成，準備{action_text}...')
+            page.wait_for_timeout(2000)
+            click_action_control(page, selector, action_text)
+            pending_messages.put(f'{action_text}成功')
+            while True:
                 try:
-                    page.wait_for_selector(config.selectors.post_login_ready, timeout=config.timing.wait_timeout_ms)
+                    if not browser.is_connected() or closed.is_set() or not context.pages or page.is_closed():
+                        break
+                    page.wait_for_timeout(500)
+                except Exception:
                     break
-                except PlaywrightTimeoutError:
-                    if attempt == 2:
-                        raise
-                    page.reload(wait_until='domcontentloaded', timeout=config.timing.navigation_timeout_ms)
-            if not click_visible_control(page.locator(selector)):
-                raise ValueError(f'找不到可點擊的控制項: {selector}')
-            if config.selectors.target_done:
-                page.wait_for_selector(config.selectors.target_done, timeout=config.timing.wait_timeout_ms)
         finally:
-            context.close()
-            browser.close()
+            try:
+                context.close()
+            except Exception:
+                pass
+            try:
+                browser.close()
+            except Exception:
+                pass
 
 
 def click_visible_control(locator) -> bool:
@@ -261,55 +266,11 @@ def click_action_control(page, action_selector: str, action_text: str) -> None:
     raise ValueError(f'找不到可點擊的{action_text}按鈕: {action_selector}')
 
 
-def open_login_page_with_captcha(config: AppConfig, pending_messages: Queue, action_label: str, action_selector: str, action_text: str) -> None:
-    with sync_playwright() as playwright:
-        browser_type = getattr(playwright, config.site.browser)
-        browser = browser_type.launch(headless=False, args=['--window-position=0,0', '--window-size=1280,900'])
-        context = browser.new_context(no_viewport=True)
-        page = context.new_page()
-        closed = Event()
-        browser.on('disconnected', lambda *_: closed.set())
-        page.on('close', lambda *_: closed.set())
-        page.goto(config.site.login_url, wait_until='domcontentloaded', timeout=config.timing.navigation_timeout_ms)
-        page.evaluate("document.documentElement.style.zoom = '67%'")
-        if not is_placeholder(config.site.username) and not is_placeholder(config.site.password):
-            page.fill(config.selectors.username, config.site.username)
-            page.fill(config.selectors.password, config.site.password)
-        if config.selectors.captcha_input:
-            page.fill(config.selectors.captcha_input, get_captcha(page, config))
-        page.wait_for_timeout(2000)
-        page.click(config.selectors.login_submit)
-        try:
-            page.wait_for_load_state('domcontentloaded', timeout=5000)
-        except PlaywrightTimeoutError:
-            pass
-        page.evaluate("document.documentElement.style.zoom = '80%'")
-        pending_messages.put(f'登入成功,準備{action_label}....')
-        page.wait_for_timeout(2000)
-        click_action_control(page, action_selector, action_text)
-        pending_messages.put(f'{action_label}成功')
-        while True:
-            try:
-                if not browser.is_connected() or closed.is_set() or not context.pages or page.is_closed():
-                    break
-                page.wait_for_timeout(500)
-            except Exception:
-                break
-        try:
-            context.close()
-        except Exception:
-            pass
-        try:
-            browser.close()
-        except Exception:
-            pass
-
-
-def run_action(config: AppConfig, selector: str) -> None:
+def run_action(config: AppConfig, selector: str, action_text: str, pending_messages: Queue) -> None:
     last_error = None
     for attempt in range(config.retry.attempts):
         try:
-            execute_action(config, selector)
+            execute_action(config, selector, action_text, pending_messages)
             return
         except (PlaywrightTimeoutError, ValueError, RuntimeError, TimeoutError) as error:
             last_error = error
@@ -406,28 +367,14 @@ def start_gui(config: AppConfig) -> None:
     def stamp_status(label: str, outcome: str) -> None:
         add_message(f'{label}{outcome}')
 
-    def action(selector: str, label: str) -> None:
+    def action(selector: str, label: str, action_text: str) -> None:
         add_message(f'{label}執行中...')
-        future = executor.submit(run_action, config, selector)
+        future = executor.submit(run_action, config, selector, action_text, pending_messages)
         def done(result) -> None:
             try:
                 result.result()
-                pending_messages.put(f'{label}成功')
             except Exception:
                 pending_messages.put(f'{label}失敗')
-        future.add_done_callback(done)
-
-    def open_login_page(action_label: str) -> None:
-        add_message('正在開啟登入畫面...')
-        action_selector = sign_in if action_label == '簽到' else sign_out
-        action_text = '上班簽到' if action_label == '簽到' else '下班簽退'
-        future = executor.submit(open_login_page_with_captcha, config, pending_messages, action_label, action_selector, action_text)
-        def done(result) -> None:
-            try:
-                result.result()
-                pending_messages.put('登入畫面已經被關閉')
-            except Exception:
-                pending_messages.put('開啟登入畫面失敗')
         future.add_done_callback(done)
 
     def create_rounded_button(parent: tk.Misc, text: str, bg_color: str, active_color: str, command) -> tk.Button:
@@ -462,9 +409,9 @@ def start_gui(config: AppConfig) -> None:
     button_font = ('Microsoft JhengHei UI', 14, 'bold')
     save_button = tk.Button(actions, text='儲存設定', font=button_font, bg='#4b8ce8', fg='white', activebackground='#2d69b8', activeforeground='white', relief='raised', bd=3, highlightthickness=0, padx=8, pady=2, width=11, height=1, command=lambda: save_from_widgets())
     save_button.grid(row=0, column=1, sticky='ew', padx=5)
-    sign_in_button = create_rounded_button(actions, '簽到', '#59c66c', '#2d8f4d', lambda: open_login_page('簽到'))
+    sign_in_button = create_rounded_button(actions, '簽到', '#59c66c', '#2d8f4d', lambda: action(sign_in, '簽到', '上班簽到'))
     sign_in_button.grid(row=0, column=0, sticky='ew', padx=(0, 5))
-    sign_out_button = create_rounded_button(actions, '簽退', '#ef9a58', '#c66b2d', lambda: open_login_page('簽退'))
+    sign_out_button = create_rounded_button(actions, '簽退', '#ef9a58', '#c66b2d', lambda: action(sign_out, '簽退', '下班簽退'))
     sign_out_button.grid(row=0, column=2, sticky='ew', padx=(5, 0))
     ttk.Label(root, textvariable=status, style='Status.TLabel', anchor='w', justify='left').pack(fill='x', padx=12, pady=5)
 
@@ -540,11 +487,11 @@ def start_gui(config: AppConfig) -> None:
         update_entry_styles(now)
         for check_in, check_out, enabled, row in widgets:
             if enabled.get() and row['date'] == current_key:
-                for kind, scheduled, selector, label in (('in', check_in.get(), sign_in, '自動簽到'), ('out', check_out.get(), sign_out, '自動簽退')):
+                for kind, scheduled, selector, label, action_text in (('in', check_in.get(), sign_in, '自動簽到', '上班簽到'), ('out', check_out.get(), sign_out, '自動簽退', '下班簽退')):
                     key = (current_key, kind)
                     if scheduled == current_time and key not in fired:
                         fired.add(key)
-                        action(selector, label)
+                        action(selector, label, action_text)
         root.after(1000, tick)
 
     render()
